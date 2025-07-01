@@ -10,8 +10,8 @@ This project is being built in stages. Here is the current progress:
 
 -   [x] **Step 1: Headline Fetching**: Connect to NewsAPI and retrieve headlines.
 -   [x] **Step 2: LLM Narration**: Integrate Google Gemini to narrate each headline.
--   [ ] **Step 3: Local Image Generation**: Use a local Hugging Face model to create an image for each headline.
--   [ ] **Step 4: User Interruption**: Implement asynchronous logic to allow real-time user questions.
+-   [X] **Step 3: Local Image Generation and MCP Server Creation**: Use a local Hugging Face model to create an image for each headline adding the MCP server for the News API logic.
+-   [X] **Step 4: User Interruption**: Implement asynchronous logic to allow real-time user questions.
 
 ---
 
@@ -49,3 +49,4 @@ With your Conda environment activated and the `.env` file in place, run the foll
 
 ```bash
 python main.py
+

@@ -1,5 +1,3 @@
-# main.py 
-
 import os
 import asyncio
 import subprocess
@@ -11,11 +9,14 @@ import torch
 import google.generativeai as genai
 from diffusers import DiffusionPipeline
 from dotenv import load_dotenv
+import requests # Import requests for the fallback
 
 # --- CLI Interaction Library ---
 from prompt_toolkit import PromptSession
-from prompt_toolkit.patch_stdout import patch_stdout
 
+# ==============================================================================
+# PART 1: SETUP AND INITIALIZATION
+# ==============================================================================
 
 def setup_apis():
     """Loads environment variables and configures APIs."""
@@ -29,7 +30,6 @@ def setup_apis():
 def initialize_image_pipeline():
     """Initializes the local text-to-image pipeline."""
     print("Initializing local image generation pipeline...")
-    # Determine device for PyTorch (GPU or CPU)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if torch.backends.mps.is_available():
         device = "mps"
@@ -38,58 +38,81 @@ def initialize_image_pipeline():
     print("Image generation pipeline ready.")
     return pipeline
 
+# ==============================================================================
+# PART 2: CORE FUNCTIONALITY
+# ==============================================================================
 
-
-async def fetch_headlines_from_mcp() -> List[str]:
+def _fetch_headlines_directly() -> List[str]:
     """
-    Launches news_server.py as a subprocess and calls its tool
-    to get headlines using a manual JSON-RPC protocol over stdio.
+    Fallback function to get headlines directly from NewsAPI.
+    This is used if the MCP server communication fails.
     """
-    print("Launching MCP news server subprocess...")
-    command = ["python", "news_server.py"]
-    
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE  # Capture stderr to see server errors
-    )
-
-    mcp_request = {
-        "jsonrpc": "2.0",
-        "method": "news_provider/get_latest_headlines",
-        "params": {"country": "us", "category": "technology"},
-        "id": 1,
-    }
-
-    request_json = json.dumps(mcp_request) + '\n'
-    process.stdin.write(request_json.encode('utf-8'))
-    await process.stdin.drain()
-
-    # Read response from server
-    response_json = await process.stdout.readline()
-    
-    # Read any errors from the server
-    server_error = await process.stderr.read()
-    if server_error:
-        print(f"MCP SERVER LOG: {server_error.decode()}")
-    
-    await process.terminate()
-
-    if not response_json:
-        print("CLIENT ERROR: No response from MCP server.")
+    print("--- MCP connection failed. Using direct API fallback. ---")
+    api_key = os.getenv("NEWS_API_KEY")
+    if not api_key:
+        return []
+    url = f"https://newsapi.org/v2/top-headlines?country=us&category=technology&apiKey={api_key}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        return [a['title'] for a in data.get('articles', []) if a.get('title')][:5]
+    except Exception as e:
+        print(f"Direct API fallback failed: {e}")
         return []
 
+async def fetch_headlines_from_mcp() -> List[str] | None:
+    """
+    Attempts the full 3-step MCP handshake. If it fails at any point,
+    it returns None to trigger the fallback.
+    """
+    print("Attempting to fetch headlines from MCP server...")
+    command = ["python", "news_server.py"]
     try:
-        response_data = json.loads(response_json)
-        if "result" in response_data:
-            return response_data["result"]
-        elif "error" in response_data:
-            print(f"MCP SERVER ERROR: {response_data['error']}")
-            return []
-    except json.JSONDecodeError:
-        print("CLIENT ERROR: Could not decode server response.")
-    return []
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        # --- Step 1: Initialize ---
+        initialize_request = {
+            "jsonrpc": "2.0", "method": "initialize",
+            "params": {"protocolVersion": "1.0", "capabilities": {}, "clientInfo": {"name": "AI News Narrator CLI"}},
+            "id": 0
+        }
+        init_req_json = json.dumps(initialize_request) + '\n'
+        process.stdin.write(init_req_json.encode('utf-8'))
+        await process.stdin.drain()
+        await process.stdout.readline()
+
+        # --- Step 2: Notify Initialized ---
+        initialized_notification = {"jsonrpc": "2.0", "method": "initialized", "params": {}}
+        init_noti_json = json.dumps(initialized_notification) + '\n'
+        process.stdin.write(init_noti_json.encode('utf-8'))
+        await process.stdin.drain()
+
+        # --- Step 3: Call Tool ---
+        tool_call_request = {
+            "jsonrpc": "2.0", "method": "tools/call",
+            "params": {"name": "get_latest_headlines", "kwargs": {"country": "us", "category": "technology"}},
+            "id": 1
+        }
+        tool_req_json = json.dumps(tool_call_request) + '\n'
+        stdout_data, stderr_data = await process.communicate(input=tool_req_json.encode('utf-8'))
+        
+        if stderr_data:
+            print(f"MCP SERVER LOG (for debugging): {stderr_data.decode()}")
+
+        if stdout_data:
+            response_data = json.loads(stdout_data)
+            if "result" in response_data:
+                print("--- MCP connection successful! ---")
+                return response_data["result"]
+            elif "error" in response_data:
+                print(f"MCP SERVER ERROR: {response_data['error']}")
+    except Exception as e:
+        print(f"Failed to execute MCP subprocess: {e}")
+    
+    return None # Return None to indicate failure and trigger fallback
 
 async def simulate_narration(text: str):
     """Prints text word-by-word to simulate a narrator."""
@@ -100,36 +123,40 @@ async def simulate_narration(text: str):
 
 async def narrate_and_handle_questions(headline: str, llm: genai.GenerativeModel):
     """
-    Narrates a headline, allows interruption for questions, and resumes.
+    Uses a robust asyncio.wait pattern to handle narration and user
+    interruption concurrently.
     """
     print("\n" + "="*80)
     print(f"H E A D L I N E: {headline}")
     print("="*80)
-    print("(Press ENTER at any time to ask a question about this headline)")
+    print("(You can start typing a question at any time and press ENTER to interrupt)")
 
     narration_prompt = f"Narrate this headline in one or two engaging sentences: '{headline}'"
     narration_response = await llm.generate_content_async(narration_prompt)
     full_narration = narration_response.text.strip()
 
-    session = PromptSession()
-    narration_task = asyncio.create_task(simulate_narration(full_narration))
-
-    while not narration_task.done():
-        try:
-            user_input = await session.prompt_async('> ', refresh_interval=0.5)
-            if user_input:
-                narration_task.cancel()
-                print("\n--- Pausing narration ---")
-                question_prompt = f"In the context of the headline '{headline}', answer this question: '{user_input}'"
-                answer_response = await llm.generate_content_async(question_prompt)
-                print(f"ANSWER: {answer_response.text.strip()}")
-                print("--- Resuming ---")
-                break
-        except (asyncio.CancelledError, EOFError):
-            break
+    session = PromptSession('> ')
     
-    if not narration_task.done():
-        narration_task.cancel()
+    narration_task = asyncio.create_task(simulate_narration(full_narration))
+    input_task = asyncio.create_task(session.prompt_async())
+
+    done, pending = await asyncio.wait(
+        [narration_task, input_task],
+        return_when=asyncio.FIRST_COMPLETED
+    )
+
+    if input_task in done:
+        user_input = input_task.result()
+        if user_input:
+            print("\n--- Pausing narration ---")
+            question_prompt = f"In the context of the headline '{headline}', answer this question: '{user_input}'"
+            answer_response = await llm.generate_content_async(question_prompt)
+            print(f"ANSWER: {answer_response.text.strip()}")
+            print("--- Resuming ---")
+
+    for task in pending:
+        task.cancel()
+
     await asyncio.sleep(1)
 
 def generate_image_locally(prompt: str, pipeline: DiffusionPipeline, index: int):
@@ -144,25 +171,28 @@ def generate_image_locally(prompt: str, pipeline: DiffusionPipeline, index: int)
     except Exception as e:
         print(f"Error generating image: {e}")
 
-
+# ==============================================================================
+# PART 3: MAIN APPLICATION EXECUTION
+# ==============================================================================
 
 async def main():
     """The main entry point for the CLI application."""
     try:
         setup_apis()
         image_pipe = initialize_image_pipeline()
-        gemini_model = genai.GenerativeModel('gemini-1.0-pro')
+        gemini_model = genai.GenerativeModel('gemini-1.5-flash')
         
         headlines = await fetch_headlines_from_mcp()
+        if headlines is None:
+            headlines = _fetch_headlines_directly()
         
-        if not headlines or "No headlines found." in headlines[0]:
-            print("Could not retrieve headlines via MCP. Exiting.")
+        if not headlines:
+            print("Could not retrieve headlines. Exiting.")
             return
 
         print("\n*** Welcome to the AI News Narrator ***")
         for i, headline in enumerate(headlines):
-            with patch_stdout():
-                await narrate_and_handle_questions(headline, gemini_model)
+            await narrate_and_handle_questions(headline, gemini_model)
             generate_image_locally(headline, image_pipe, i)
             
         print("\n" + "="*80 + "\nAll headlines processed. Application finished.")
@@ -171,6 +201,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
