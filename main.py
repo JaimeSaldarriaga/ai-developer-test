@@ -1,6 +1,6 @@
 import os
+import sys # Import the sys module
 import asyncio
-import subprocess
 import json
 from typing import List
 
@@ -11,12 +11,14 @@ from diffusers import DiffusionPipeline
 from dotenv import load_dotenv
 import requests # Import requests for the fallback
 
+
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
+
 # --- CLI Interaction Library ---
 from prompt_toolkit import PromptSession
 
-# ==============================================================================
-# PART 1: SETUP AND INITIALIZATION
-# ==============================================================================
+
 
 def setup_apis():
     """Loads environment variables and configures APIs."""
@@ -38,9 +40,7 @@ def initialize_image_pipeline():
     print("Image generation pipeline ready.")
     return pipeline
 
-# ==============================================================================
-# PART 2: CORE FUNCTIONALITY
-# ==============================================================================
+
 
 def _fetch_headlines_directly() -> List[str]:
     """
@@ -63,56 +63,39 @@ def _fetch_headlines_directly() -> List[str]:
 
 async def fetch_headlines_from_mcp() -> List[str] | None:
     """
-    Attempts the full 3-step MCP handshake. If it fails at any point,
-    it returns None to trigger the fallback.
+    Connects to the news_server.py subprocess using the correct Python
+    executable to ensure a stable environment.
     """
-    print("Attempting to fetch headlines from MCP server...")
-    command = ["python", "news_server.py"]
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        # --- Step 1: Initialize ---
-        initialize_request = {
-            "jsonrpc": "2.0", "method": "initialize",
-            "params": {"protocolVersion": "1.0", "capabilities": {}, "clientInfo": {"name": "AI News Narrator CLI"}},
-            "id": 0
-        }
-        init_req_json = json.dumps(initialize_request) + '\n'
-        process.stdin.write(init_req_json.encode('utf-8'))
-        await process.stdin.drain()
-        await process.stdout.readline()
+    print("Attempting to fetch headlines from MCP server using official client...")
 
-        # --- Step 2: Notify Initialized ---
-        initialized_notification = {"jsonrpc": "2.0", "method": "initialized", "params": {}}
-        init_noti_json = json.dumps(initialized_notification) + '\n'
-        process.stdin.write(init_noti_json.encode('utf-8'))
-        await process.stdin.drain()
-
-        # --- Step 3: Call Tool ---
-        tool_call_request = {
-            "jsonrpc": "2.0", "method": "tools/call",
-            "params": {"name": "get_latest_headlines", "kwargs": {"country": "us", "category": "technology"}},
-            "id": 1
-        }
-        tool_req_json = json.dumps(tool_call_request) + '\n'
-        stdout_data, stderr_data = await process.communicate(input=tool_req_json.encode('utf-8'))
-        
-        if stderr_data:
-            print(f"MCP SERVER LOG (for debugging): {stderr_data.decode()}")
-
-        if stdout_data:
-            response_data = json.loads(stdout_data)
-            if "result" in response_data:
-                print("--- MCP connection successful! ---")
-                return response_data["result"]
-            elif "error" in response_data:
-                print(f"MCP SERVER ERROR: {response_data['error']}")
-    except Exception as e:
-        print(f"Failed to execute MCP subprocess: {e}")
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=["news_server.py"],
+        env=os.environ
+    )
     
-    return None # Return None to indicate failure and trigger fallback
+    try:
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                tool_result = await session.call_tool(
+                    "get_latest_headlines",
+                    arguments={"country": "us", "category": "technology"}
+                )
+
+                if isinstance(tool_result, types.CallToolResult) and tool_result.structured:
+                    final_result = tool_result.structured.get("result")
+                    if isinstance(final_result, list):
+                        print("--- MCP connection successful! ---")
+                        return final_result
+
+                print(f"MCP client returned unexpected data structure: {tool_result}")
+
+    except Exception as e:
+        print(f"Failed to execute MCP with official client: {e}")
+    
+    return None
 
 async def simulate_narration(text: str):
     """Prints text word-by-word to simulate a narrator."""
@@ -171,9 +154,7 @@ def generate_image_locally(prompt: str, pipeline: DiffusionPipeline, index: int)
     except Exception as e:
         print(f"Error generating image: {e}")
 
-# ==============================================================================
-# PART 3: MAIN APPLICATION EXECUTION
-# ==============================================================================
+
 
 async def main():
     """The main entry point for the CLI application."""
